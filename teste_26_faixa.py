@@ -35,9 +35,10 @@ from numba import njit, prange
 # CONFIGURAÇÃO PADRÃO
 # ==============================================================================
 K_DEFAULT           = 26             # Valor alvo da soma de cubos: x³ + y³ + z³ = K
-DIGITOS_MIN_DEFAULT = 6              # Mínimo de dígitos na faixa (ponto central inicial)
+DIGITOS_MIN_DEFAULT = 9              # Mínimo de dígitos na faixa (ponto central inicial)
 DIGITOS_MAX_DEFAULT = None           # Máximo de dígitos (None = livre até esgotar o tempo)
-TEMPO_DEFAULT       = 30.0           # Tempo limite padrão em segundos (ex: 300.0)
+TEMPO_DEFAULT       = 300.0           # Tempo limite padrão em segundos (ex: 300.0)
+N_CHUNKS            = 64
 CRITERIO_DEFAULT    = 'ampla'        # 'ampla', 'faixa_termos' ou 'magnitude'
 
 # Limite teórico exato onde y³ cabe em inteiros não-assinados de 128 BITS (2¹²⁸ - 1)
@@ -153,7 +154,16 @@ def isqrt128(disc_hi, disc_lo):
 # MOTOR JIT DE ANÉIS CONCÊNTRICOS COM ARITMÉTICA DE 128 BITS (PARALELO)
 # ==============================================================================
 @njit(parallel=True, cache=True)
-def scan_ring_numba_128(c_start, c_end, y_min_global, y_max_global, K, R_filter, n_chunks=64):
+def scan_ring_numba_128(
+    c_start,
+    c_end,
+    y_min_global,
+    y_max_global,
+    K,
+    R_filter,
+    n_chunks=64,
+    progress_counts=None,
+):
     """
     Varre a região retangular no plano (c, y) utilizando Booker com precisão de 128 bits.
     Capacidade de alcance: até 13 dígitos numéricos sem overflow.
@@ -177,6 +187,7 @@ def scan_ring_numba_128(c_start, c_end, y_min_global, y_max_global, K, R_filter,
             continue
             
         local = 0
+        local_iterations = 0
         for c in range(local_c_start, local_c_end):
             c_u64 = np.uint64(c)
             hi_c, lo_c = cube64_to_128(c_u64)
@@ -199,6 +210,11 @@ def scan_ring_numba_128(c_start, c_end, y_min_global, y_max_global, K, R_filter,
                 y_start = 3
                 
             for y in range(y_start, y_max_global + 1, 3):
+                if progress_counts is not None:
+                    local_iterations += 1
+                    if local_iterations % 1024 == 0:
+                        progress_counts[ch] = local_iterations
+
                 y_u64 = np.uint64(y)
                 hi_y, lo_y = cube64_to_128(y_u64)
                 
@@ -244,8 +260,10 @@ def scan_ring_numba_128(c_start, c_end, y_min_global, y_max_global, K, R_filter,
                         results[ch, local, 1] = y
                         results[ch, local, 2] = x
                         local += 1
-                        
+
         counts[ch] = local
+        if progress_counts is not None:
+            progress_counts[ch] = local_iterations
     return results, counts
 
 
@@ -344,8 +362,10 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
     print(f"Ponto de Partida R₀      : {R_start:,} (~{digitos_min} dígitos)")
     print(f"Memória RAM Alocada      : < 100 KB (buffer constante por chunks)")
     print("Inicializando JIT Numba com motor aritmético de 128 bits...")
-    # Warmup
+    # Compile both regular and monitored Numba signatures before timing the search.
     scan_ring_numba_128(1, 10, 1, 10, K, 10, 2)
+    warm_progress = np.zeros(N_CHUNKS, dtype=np.int64)
+    scan_ring_numba_128(1, 10, 1, 10, K, 10, N_CHUNKS, warm_progress)
     
     print("\nIniciando expansão concêntrica da circunferência de busca...")
     print("-" * 75)
@@ -355,11 +375,70 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
     
     solucoes_encontradas = {}
     total_aneis = 0
-    t0 = time.time()
+    total_iterations = 0
+    next_report_second = 1
+    previous_report_iterations = 0
+    t0 = time.perf_counter()
     interrompido_por_bits = False
+    progress_counts = np.zeros(N_CHUNKS, dtype=np.int64)
+    progress_state = {"phase": "preparando", "ring_end": R_current}
+
+    def report_progress():
+        nonlocal next_report_second, previous_report_iterations
+        elapsed = time.perf_counter() - t0
+        while elapsed >= next_report_second and next_report_second <= tempo_limite:
+            interval_iterations = total_iterations - previous_report_iterations
+            average_rate = total_iterations / elapsed if elapsed > 0 else 0.0
+            pct_tempo = min(100.0, (elapsed / tempo_limite) * 100.0) if tempo_limite > 0 else 100.0
+            print(
+                f"[t={next_report_second:3d}s/{tempo_limite:.0f}s {pct_tempo:5.1f}%] "
+                f"iter/s={interval_iterations:,} total={total_iterations:,} "
+                f"média={average_rate:,.0f}/s | R-alvo={progress_state['ring_end']:,} "
+                f"| {progress_state['phase']}",
+                flush=True,
+            )
+            previous_report_iterations = total_iterations
+            next_report_second += 1
+
+    def scan_region(c_start, c_end, y_start, y_end, phase, new_hits):
+        nonlocal total_iterations
+        progress_state["phase"] = phase
+        c_batch_size = N_CHUNKS
+        c_cursor = c_start
+        while c_cursor <= c_end:
+            if time.perf_counter() - t0 >= tempo_limite:
+                return False
+
+            c_batch_end = min(c_end, c_cursor + c_batch_size - 1)
+            progress_counts.fill(0)
+            batch_start = time.perf_counter()
+            results, counts = scan_ring_numba_128(
+                c_cursor,
+                c_batch_end,
+                y_start,
+                y_end,
+                K,
+                R_next,
+                N_CHUNKS,
+                progress_counts,
+            )
+            batch_elapsed = time.perf_counter() - batch_start
+            total_iterations += int(np.sum(progress_counts))
+            for ch in range(len(counts)):
+                for idx in range(int(counts[ch])):
+                    new_hits.add(tuple(int(v) for v in results[ch, idx]))
+
+            c_cursor = c_batch_end + 1
+            report_progress()
+            if batch_elapsed > 0.75:
+                c_batch_size = max(1, c_batch_size // 2)
+            elif batch_elapsed < 0.15:
+                c_batch_size = min(N_CHUNKS, c_batch_size * 2)
+
+        return time.perf_counter() - t0 < tempo_limite
     
     while True:
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
         if elapsed >= tempo_limite:
             break
             
@@ -379,32 +458,42 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
         C0 = c_max_for(R_current, K)
         C1 = c_max_for(R_next, K)
         
-        t_step_0 = time.time()
+        t_step_0 = time.perf_counter()
         novos_hits = set()
+        ring_complete = True
         
         # Decomposição exata do anel concêntrico [R_current, R_next]
         if R_current == 0:
-            res_B, cnt_B = scan_ring_numba_128(1, C1, 1, R_next, K, R_next)
-            for ch in range(len(cnt_B)):
-                for idx in range(cnt_B[ch]):
-                    novos_hits.add(tuple(int(v) for v in res_B[ch, idx]))
+            progress_state["ring_end"] = R_next
+            ring_complete = scan_region(1, C1, 1, R_next, "parte inicial", novos_hits)
         else:
             # Parte A: c ∈ [1, C0], y ∈ [R_current + 1, R_next]
             if C0 >= 1:
-                res_A, cnt_A = scan_ring_numba_128(1, C0, R_current + 1, R_next, K, R_next)
-                for ch in range(len(cnt_A)):
-                    for idx in range(cnt_A[ch]):
-                        novos_hits.add(tuple(int(v) for v in res_A[ch, idx]))
+                progress_state["ring_end"] = R_next
+                ring_complete = scan_region(
+                    1,
+                    C0,
+                    R_current + 1,
+                    R_next,
+                    f"anel {total_aneis + 1}, parte A",
+                    novos_hits,
+                )
                         
             # Parte B: c ∈ [C0 + 1, C1], y ∈ [1, R_next]
-            if C1 > C0:
-                res_B, cnt_B = scan_ring_numba_128(C0 + 1, C1, 1, R_next, K, R_next)
-                for ch in range(len(cnt_B)):
-                    for idx in range(cnt_B[ch]):
-                        novos_hits.add(tuple(int(v) for v in res_B[ch, idx]))
+            if ring_complete and C1 > C0:
+                ring_complete = scan_region(
+                    C0 + 1,
+                    C1,
+                    1,
+                    R_next,
+                    f"anel {total_aneis + 1}, parte B",
+                    novos_hits,
+                )
                         
-        dt_step = time.time() - t_step_0
-        total_aneis += 1
+        dt_step = time.perf_counter() - t_step_0
+        if ring_complete:
+            R_current = R_next
+            total_aneis += 1
         
         hits_neste_anel = 0
         for triplet in novos_hits:
@@ -422,31 +511,47 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
                     print(f"    Dígitos dos termos : {props['digitos']}  |  Magnitude: {props['mag']:,} ({props['d_max']} dígitos)")
                     print(f"    Verificação cúbica : ({x})³ + ({y})³ + ({z})³ = {x**3 + y**3 + z**3}")
                     
-        R_current = R_next
-        elapsed = time.time() - t0
-        pct_tempo = min(100.0, (elapsed / tempo_limite) * 100.0)
-        d_atual = len(str(R_current))
-        status_line = (
-            f"[Tempo: {elapsed:5.1f}s / {tempo_limite:5.1f}s ({pct_tempo:4.1f}%)] "
-            f"Raio R: {R_current:10,d} (~{d_atual} dígitos) | Anel #{total_aneis:02d} | "
-            f"Total Soluções: {len(solucoes_encontradas)}"
-        )
-        print(status_line)
+        elapsed = time.perf_counter() - t0
+        if ring_complete:
+            d_atual = len(str(R_current))
+            print(
+                f"[Anel #{total_aneis:02d} concluído em {dt_step:.2f}s] "
+                f"Raio R={R_current:,} (~{d_atual} dígitos) | "
+                f"Soluções: {len(solucoes_encontradas)}"
+            )
+        else:
+            print(
+                f"[Anel interrompido] R totalmente concluído permanece em {R_current:,}; "
+                f"o anel parcial tinha limite {R_next:,}."
+            )
+
+        if not ring_complete or elapsed >= tempo_limite:
+            break
         
         if dt_step < 0.6:
             delta_R = int(delta_R * 1.5)
         elif dt_step > 2.5:
             delta_R = max(5_000, int(delta_R * 0.7))
-            
+
     # Resumo Final
-    tempo_total = time.time() - t0
+    tempo_total = time.perf_counter() - t0
     print("\n" + "=" * 75)
     print("RELATÓRIO FINAL DA BUSCA TEMPORAL (128 BITS)")
     print("=" * 75)
     print(f"Tempo total gasto           : {tempo_total:.2f} segundos (limite era {tempo_limite:.1f} s)")
     print(f"Raio atingido no tempo      : R = {R_current:,} (~{len(str(R_current))} dígitos)")
     print(f"Anéis concêntricos varridos : {total_aneis} anéis")
+    print(f"Iterações de y realizadas   : {total_iterations:,}")
+    print(f"Taxa média observada        : {total_iterations / tempo_total:,.0f} iterações/s" if tempo_total > 0 else "Taxa média observada        : n/a")
     print(f"Soluções únicas encontradas : {len(solucoes_encontradas)}")
+
+    if K == 26:
+        target = KNOWN_26[6]["triplet"]
+        target_radius = max(abs(value) for value in target)
+        target_key = tuple(sorted(abs(value) for value in target))
+        target_found = target_key in solucoes_encontradas
+        print(f"Faixa do alvo de 9 dígitos   : {'atingida' if R_current >= target_radius else 'não atingida'} (R alvo={target_radius:,})")
+        print(f"Solução de 9 dígitos achada  : {'sim' if target_found else 'não'}")
     
     selecionadas = []
     for chave, (x, y, z, props) in solucoes_encontradas.items():
