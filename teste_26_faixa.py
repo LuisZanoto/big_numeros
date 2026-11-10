@@ -29,7 +29,7 @@ import time
 import math
 import argparse
 import numpy as np
-from numba import njit, prange
+from numba import get_num_threads, njit, prange
 
 # ==============================================================================
 # CONFIGURAÇÃO PADRÃO
@@ -39,6 +39,7 @@ DIGITOS_MIN_DEFAULT = 9              # Mínimo de dígitos na faixa (ponto centr
 DIGITOS_MAX_DEFAULT = None           # Máximo de dígitos (None = livre até esgotar o tempo)
 TEMPO_DEFAULT       = 300.0           # Tempo limite padrão em segundos (ex: 300.0)
 N_CHUNKS            = 64
+RAIO_MAX_DEFAULT    = 200_000_000
 CRITERIO_DEFAULT    = 'ampla'        # 'ampla', 'faixa_termos' ou 'magnitude'
 
 # Limite teórico exato onde y³ cabe em inteiros não-assinados de 128 BITS (2¹²⁸ - 1)
@@ -332,11 +333,19 @@ def atende_criterio(props, digitos_min, digitos_max, criterio):
 # ==============================================================================
 # MOTOR DE BUSCA TEMPORAL CONCÊNTRICA (128 BITS)
 # ==============================================================================
-def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO_DEFAULT, criterio=CRITERIO_DEFAULT):
+def executar_busca_temporal(
+    K,
+    digitos_min,
+    digitos_max=None,
+    tempo_limite=TEMPO_DEFAULT,
+    criterio=CRITERIO_DEFAULT,
+    raio_max=RAIO_MAX_DEFAULT,
+):
     print("=" * 75)
     print(f"BUSCA TEMPORAL 128-BIT DE SOMA DE CUBOS: x³ + y³ + z³ = {K}")
     print(f"Precisão de Inteiros     : 128 BITS NATIVO (alcance de até 13 dígitos)")
     print(f"Ponto Central (Origem)   : A partir de {digitos_min} dígitos")
+    print(f"Teto dos termos          : {raio_max:,}")
     if digitos_max:
         print(f"Teto Opcional de Parada  : Até {digitos_max} dígitos (R = 10^{digitos_max} = {10**digitos_max:,})")
     else:
@@ -351,15 +360,21 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
         print("Números da forma 9m ± 4 não possuem nenhuma solução inteira na soma de três cubos.")
         return []
 
+    if raio_max < 1 or raio_max > R_LIMIT_INT128:
+        raise ValueError(f"raio_max deve estar entre 1 e {R_LIMIT_INT128:,}.")
+
     # Definição do Ponto Central R0
     if digitos_min <= 1:
         R_start = 0
     else:
         R_start = 10 ** (digitos_min - 1)
         
-    R_target_max = 10 ** digitos_max if digitos_max is not None else float("inf")
+    R_target_max = raio_max
+    if digitos_max is not None:
+        R_target_max = min(R_target_max, 10 ** digitos_max)
     
     print(f"Ponto de Partida R₀      : {R_start:,} (~{digitos_min} dígitos)")
+    print(f"Workers paralelos Numba  : {get_num_threads()}")
     print(f"Memória RAM Alocada      : < 100 KB (buffer constante por chunks)")
     print("Inicializando JIT Numba com motor aritmético de 128 bits...")
     # Compile both regular and monitored Numba signatures before timing the search.
@@ -376,39 +391,60 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
     solucoes_encontradas = {}
     total_aneis = 0
     total_iterations = 0
-    next_report_second = 1
+    next_report_second = 10
     previous_report_iterations = 0
+    previous_report_time = 0.0
     t0 = time.perf_counter()
     interrompido_por_bits = False
     progress_counts = np.zeros(N_CHUNKS, dtype=np.int64)
-    progress_state = {"phase": "preparando", "ring_end": R_current}
+    progress_state = {
+        "phase": "preparando",
+        "ring_end": R_current,
+        "current_c": 0,
+        "c_end": 0,
+        "y_start": 0,
+        "y_end": 0,
+    }
 
     def report_progress():
-        nonlocal next_report_second, previous_report_iterations
+        nonlocal next_report_second, previous_report_iterations, previous_report_time
         elapsed = time.perf_counter() - t0
         while elapsed >= next_report_second and next_report_second <= tempo_limite:
             interval_iterations = total_iterations - previous_report_iterations
+            interval_seconds = max(elapsed - previous_report_time, 1e-9)
+            interval_rate = interval_iterations / interval_seconds
             average_rate = total_iterations / elapsed if elapsed > 0 else 0.0
             pct_tempo = min(100.0, (elapsed / tempo_limite) * 100.0) if tempo_limite > 0 else 100.0
+            c_progress = f"c={progress_state['current_c']:,}/{progress_state['c_end']:,}"
+            if K == 26:
+                c_target = abs(KNOWN_26[6]["triplet"][0] + KNOWN_26[6]["triplet"][2])
+                c_progress += f" (alvo {c_target:,})"
             print(
                 f"[t={next_report_second:3d}s/{tempo_limite:.0f}s {pct_tempo:5.1f}%] "
-                f"iter/s={interval_iterations:,} total={total_iterations:,} "
+                f"iter/s={interval_rate:,.0f} (+{interval_iterations:,}) total={total_iterations:,} "
                 f"média={average_rate:,.0f}/s | R-alvo={progress_state['ring_end']:,} "
+                f"| {c_progress}, x+z=-c | y=[{progress_state['y_start']:,},"
+                f"{progress_state['y_end']:,}] | x,z∈[-{raio_max:,},{raio_max:,}] "
                 f"| {progress_state['phase']}",
                 flush=True,
             )
             previous_report_iterations = total_iterations
+            previous_report_time = elapsed
             next_report_second += 1
 
     def scan_region(c_start, c_end, y_start, y_end, phase, new_hits):
         nonlocal total_iterations
         progress_state["phase"] = phase
+        progress_state["y_start"] = y_start
+        progress_state["y_end"] = y_end
         c_batch_size = N_CHUNKS
         c_cursor = c_start
+        progress_state["c_end"] = c_end
         while c_cursor <= c_end:
             if time.perf_counter() - t0 >= tempo_limite:
                 return False
 
+            progress_state["current_c"] = c_cursor
             c_batch_end = min(c_end, c_cursor + c_batch_size - 1)
             progress_counts.fill(0)
             batch_start = time.perf_counter()
@@ -418,7 +454,7 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
                 y_start,
                 y_end,
                 K,
-                R_next,
+                raio_max,
                 N_CHUNKS,
                 progress_counts,
             )
@@ -429,6 +465,7 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
                     new_hits.add(tuple(int(v) for v in results[ch, idx]))
 
             c_cursor = c_batch_end + 1
+            progress_state["current_c"] = c_cursor
             report_progress()
             if batch_elapsed > 0.75:
                 c_batch_size = max(1, c_batch_size // 2)
@@ -443,7 +480,7 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
             break
             
         if R_current >= R_target_max:
-            print(f"\n[SUCESSO] Teto máximo de dígitos solicitado ({digitos_max} dígitos) alcançado com sucesso!")
+            print(f"\n[SUCESSO] Teto máximo de termos alcançado: R = {R_target_max:,}.")
             break
             
         if R_current >= R_LIMIT_INT128:
@@ -451,9 +488,7 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
             print(f"\n[FRONTEIRA DE 128 BITS ALCANÇADA]: R = {R_current:,} (~13 dígitos).")
             break
             
-        R_next = min(R_current + delta_R, R_LIMIT_INT128)
-        if R_target_max != float("inf"):
-            R_next = min(R_next, R_target_max)
+        R_next = min(R_current + delta_R, R_target_max, R_LIMIT_INT128)
             
         C0 = c_max_for(R_current, K)
         C1 = c_max_for(R_next, K)
@@ -550,8 +585,17 @@ def executar_busca_temporal(K, digitos_min, digitos_max=None, tempo_limite=TEMPO
         target_radius = max(abs(value) for value in target)
         target_key = tuple(sorted(abs(value) for value in target))
         target_found = target_key in solucoes_encontradas
+        target_c = abs(target[0] + target[2])
+        c_progress_pct = min(100.0, progress_state["current_c"] / target_c * 100.0)
         print(f"Faixa do alvo de 9 dígitos   : {'atingida' if R_current >= target_radius else 'não atingida'} (R alvo={target_radius:,})")
         print(f"Solução de 9 dígitos achada  : {'sim' if target_found else 'não'}")
+        print(f"Progresso no c do alvo       : {progress_state['current_c']:,}/{target_c:,} ({c_progress_pct:.6f}%)")
+        full_search_estimate = (math.pow(4.0, 1.0 / 3.0) / 6.0) * target_radius**2
+        work_fraction = total_iterations / full_search_estimate * 100.0
+        projected_iterations = total_iterations / tempo_total * 300.0 if tempo_total > 0 else 0.0
+        projected_fraction = projected_iterations / full_search_estimate * 100.0
+        print(f"Trabalho aproximado ao alvo : {work_fraction:.6f}% do total estimado")
+        print(f"Projeção linear para 300 s  : {projected_fraction:.6f}% (pode variar com a máquina/carga)")
     
     selecionadas = []
     for chave, (x, y, z, props) in solucoes_encontradas.items():
@@ -592,6 +636,12 @@ def parse_args():
     parser.add_argument("--k", type=int, default=K_DEFAULT, help=f"Valor de K (padrão: {K_DEFAULT})")
     parser.add_argument("--min", type=int, default=None, help=f"Dígitos mínimos / ponto central (padrão: {DIGITOS_MIN_DEFAULT})")
     parser.add_argument("--max", type=int, default=None, help="Dígitos máximos / teto opcional de parada")
+    parser.add_argument(
+        "--raio-max",
+        type=int,
+        default=RAIO_MAX_DEFAULT,
+        help=f"Maior valor absoluto permitido para x, y e z (padrão: {RAIO_MAX_DEFAULT:,}).",
+    )
     parser.add_argument("-t", "--tempo", type=float, default=TEMPO_DEFAULT, help=f"Tempo limite em segundos (padrão: {TEMPO_DEFAULT} s, ex: 300)")
     parser.add_argument(
         "--criterio",
@@ -618,11 +668,11 @@ def parse_args():
     if d_min is None:
         d_min = DIGITOS_MIN_DEFAULT
         
-    return k, d_min, d_max, tempo, args.criterio, args.interativo
+    return k, d_min, d_max, tempo, args.criterio, args.interativo, args.raio_max
 
 
 if __name__ == "__main__":
-    k, d_min, d_max, tempo, criterio, interativo = parse_args()
+    k, d_min, d_max, tempo, criterio, interativo, raio_max = parse_args()
     
     if interativo:
         print("\n=== CONFIGURAÇÃO INTERATIVA (BUSCA TEMPORAL 128-BIT) ===")
@@ -638,6 +688,10 @@ if __name__ == "__main__":
             max_in = input(f"Dígitos MÁXIMOS (Pressione Enter para ilimitado) [{d_max if d_max else 'livre'}]: ").strip()
             if max_in:
                 d_max = int(max_in)
+
+            raio_in = input(f"Maior valor absoluto dos termos [padrão {raio_max:,}]: ").strip()
+            if raio_in:
+                raio_max = int(raio_in)
                 
             tempo_in = input(f"Tempo limite em SEGUNDOS [padrão {tempo} s]: ").strip()
             if tempo_in:
@@ -653,4 +707,4 @@ if __name__ == "__main__":
         except (ValueError, EOFError):
             print("\nEntrada inválida ou cancelada. Usando valores configurados.")
             
-    executar_busca_temporal(k, d_min, d_max, tempo, criterio)
+    executar_busca_temporal(k, d_min, d_max, tempo, criterio, raio_max)
