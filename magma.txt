@@ -1,0 +1,15 @@
+https://magma-maths.org/calc/
+
+// 1. Definir a curva elíptica Y^2 = X^3 - 45360
+E := EllipticCurve([0, 0, 0, 0, -45360]);
+
+// 2. (Opcional) Verificar o posto (rank) da curva
+print "Posto da curva:", Rank(E);
+
+// 3. Obter e imprimir TODOS os pontos inteiros
+pontos := IntegralPoints(E);
+print "Todos os pontos inteiros:", pontos;
+
+produziu :
+Todos os pontos inteiros: [ (36 : -36 : 1), (1044 : -33732 : 1),
+ (2844 : 151668 : 1), (6721 : -550999 : 1) ]

@@ -1,0 +1,22 @@
+atenção: mudar para mumba o arquivo teste_26.py pois:
+CPU multiprocessing : 1667.268 s   hits=20
+Numba prange        :   33.852 s   hits=20
+Speedup             :  49.25x
+
+
+OBS : 
+
+para o x³ + y³ + z³ = k, 114 dificil
+
+114
+390
+627
+633
+732
+921
+975
+
+É exatamente por isso que o 114 assumiu o posto de
+ menor número inteiro positivo abaixo de 1000 ainda em aberto.
+  Quem conseguir fechar essa conta vai direto para 
+  os anpales da matemática moderna!
