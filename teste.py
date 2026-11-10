@@ -15,16 +15,17 @@ except ImportError:
 #KNOWN_Z =  -2_736_111_468_807_040
 
 # testando para k=26 (114844365, 110902301, -142254840)
+# testtando para k=26  (-74169, 139643, -132288)
 K = 26
-KNOWN_X =   114_844_365
-KNOWN_Y =  110_902_301
-KNOWN_Z =  -142_254_840
+KNOWN_X =   -74_169
+KNOWN_Y =  139_643
+KNOWN_Z =  -132_288
 
 
-KNOWN_D = KNOWN_X + KNOWN_Y          # = 87_723_532_425_289  (x+y)
+KNOWN_D = KNOWN_X + KNOWN_Y          # x + y = 65,474
 
-Z_RADIUS = 500          # ±500 → 1001 valores de z
-D_RADIUS = 5_900_000     # ±900k → 1800.001 valores de d por z
+Z_RADIUS = 200_500          # ±500 → 1001 valores de z
+D_RADIUS = 200_000      # ±100k → 200,001 valores de d por z
 
 Z_LO, Z_HI = KNOWN_Z - Z_RADIUS, KNOWN_Z + Z_RADIUS + 1
 D_LO, D_HI = KNOWN_D - D_RADIUS, KNOWN_D + D_RADIUS + 1
@@ -37,6 +38,8 @@ print(f"Numba CPU prange: {NUMBA_OK}")
 # =================== VERIFICAÇÃO EXATA ===================
 def verify(z, d):
     """Dado (z,d), resolve x,y por Bhaskara e confirma x³+y³+z³=K."""
+    if d == 0:
+        return None
     N = K - z**3
     if N % d != 0:
         return None
@@ -71,6 +74,8 @@ if NUMBA_OK:
         n = d_hi - d_lo
         for i in prange(n):
             d = d_lo + i
+            if d == 0:
+                continue
             r = 0
             for j in range(limbs.shape[0]-1, -1, -1):
                 r = (r * 65536 + int(limbs[j])) % d
@@ -116,5 +121,6 @@ if __name__ == "__main__":
         raise SystemExit("Numba não está instalado. Instale com: pip install numba")
 
     expected = (KNOWN_X, KNOWN_Y, KNOWN_Z)
+    expected_found = expected in hits or (expected[1], expected[0], expected[2]) in hits
     print(f"\nSolução de Booker (teste): {expected}")
-    print(f"Encontrada no Numba CPU:   {expected in hits}")
+    print(f"Encontrada no Numba CPU:   {expected_found}")
